@@ -1,0 +1,5 @@
+# Git attributes for cross-platform compatibility
+*.sh text eol=lf
+*.patch text eol=lf
+*.md text
+*.txt text

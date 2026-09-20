@@ -1,0 +1,27 @@
+# Build outputs and kernel modules
+*.ko
+*.ko.xz
+*.ko.zst
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+
+# Kernel source tarballs and build directories
+linux-*.tar.xz
+linux-*.tar.gz
+linux-*/
+build/*
+tmp/*
+
+# Backups and temporary files
+*.bak
+*.bak.*
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local planning documents
+KERNEL_INDEPENDENCE_PLAN.md
