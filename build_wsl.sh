@@ -6,7 +6,7 @@
 #   ./build_wsl.sh [KERNEL_VERSION] [--clean|-c] [--powercap-only|--zerofan-only|--both]
 #
 # Example:
-#   ./build_wsl.sh 6.18.33-Unraid
+#   ./build_wsl.sh 6.18.58-Unraid
 
 set -euo pipefail
 
@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POWERCAP_PATCH="$SCRIPT_DIR/patches/w6800-powercap-min-120W.patch"
 ZEROFAN_PATCH="$SCRIPT_DIR/patches/w6800-zerofan-unlock.patch"
 
-TARGET_KREL="6.18.33-Unraid"
+TARGET_KREL="6.18.58-Unraid"
 CLEAN_MODE=0
 PATCH_CHOICE=""
 

@@ -14,24 +14,41 @@ TARGET_DEVICE="0x73a3" # Radeon PRO W6800 strictly
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] [W6800-Powercap] $*"
+  logger -t "W6800-Powercap" "$*" 2>/dev/null || true
 }
 
 log "Unraid Array started. Ensuring W6800 120W unlock and applying ${TARGET_WATTS}W power cap..."
 
-# 1. Hot-swap driver if patched module is not loaded yet (e.g. fresh reboot)
+# 1. Hot-swap driver if patched module is not loaded yet or if PATCHED_KO was updated
 PATCHED_KO="/boot/config/custom/w6800/amdgpu.ko"
 if [ -f "$PATCHED_KO" ]; then
   CURRENT_MOD_DIR="/lib/modules/$(uname -r)/kernel/drivers/gpu/drm/amd/amdgpu"
-  # Avoid 'grep -q' on a pipe with 'set -o pipefail': grep -q closes the pipe early
-  # upon first match, causing 'dmesg: write error: Broken pipe' and non-zero pipefail.
-  if ! dmesg 2>/dev/null | grep -E "W6800 (powerfix|zerofan)" >/dev/null 2>&1; then
-    log "Patched driver marker not found in dmesg. Performing hot-swap..."
+  NEEDS_SWAP=0
+
+  if ! lsmod | grep -E "^amdgpu " >/dev/null 2>&1; then
+    NEEDS_SWAP=1
+  elif ! cmp -s "$PATCHED_KO" "$CURRENT_MOD_DIR/amdgpu.ko" 2>/dev/null; then
+    NEEDS_SWAP=1
+  elif ! dmesg 2>/dev/null | grep "W6800 powerfix" >/dev/null 2>&1; then
+    NEEDS_SWAP=1
+  elif ! dmesg 2>/dev/null | grep "W6800 zerofan" >/dev/null 2>&1; then
+    NEEDS_SWAP=1
+  fi
+
+  if [ "$NEEDS_SWAP" -eq 1 ]; then
+    log "Updating and hot-swapping patched amdgpu.ko..."
     cp -f "$PATCHED_KO" "$CURRENT_MOD_DIR/amdgpu.ko"
     rm -f "$CURRENT_MOD_DIR/amdgpu.ko.xz" "$CURRENT_MOD_DIR/amdgpu.ko.zst"
     depmod -a
+    echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null || true
     modprobe -r amdgpu 2>/dev/null || true
-    modprobe amdgpu
-    sleep 2
+    if ! lsmod | grep -E "^amdgpu " >/dev/null 2>&1; then
+      modprobe amdgpu
+      sleep 2
+      log "Hot-swap completed successfully."
+    else
+      log "WARNING: Could not unload running amdgpu module (GPU is in use). Stop GPU containers/VMs and re-run, or reboot."
+    fi
   fi
 fi
 
