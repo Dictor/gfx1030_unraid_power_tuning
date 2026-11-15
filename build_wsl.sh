@@ -3,7 +3,7 @@
 #
 # Usage (inside WSL):
 #   chmod +x build_wsl.sh
-#   ./build_wsl.sh [KERNEL_VERSION]
+#   ./build_wsl.sh [KERNEL_VERSION] [--clean|-c] [--powercap-only|--zerofan-only|--both]
 #
 # Example:
 #   ./build_wsl.sh 6.18.33-Unraid
@@ -11,15 +11,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH_FILE="$SCRIPT_DIR/patches/w6800-powercap-min-120W.patch"
+POWERCAP_PATCH="$SCRIPT_DIR/patches/w6800-powercap-min-120W.patch"
+ZEROFAN_PATCH="$SCRIPT_DIR/patches/w6800-zerofan-unlock.patch"
 
 TARGET_KREL="6.18.33-Unraid"
 CLEAN_MODE=0
+PATCH_CHOICE=""
 
 for arg in "$@"; do
   case "$arg" in
     --clean|-c)
       CLEAN_MODE=1
+      ;;
+    --powercap-only)
+      PATCH_CHOICE="1"
+      ;;
+    --zerofan-only)
+      PATCH_CHOICE="2"
+      ;;
+    --both)
+      PATCH_CHOICE="3"
       ;;
     *)
       if [[ "$arg" != -* ]]; then
@@ -41,27 +52,78 @@ fi
 WORK_DIR="/tmp/amdgpu-build-${TARGET_KREL}"
 OUT_DIR="$SCRIPT_DIR/build/output"
 
-if [ "$CLEAN_MODE" -eq 1 ] && [ -d "$WORK_DIR" ]; then
-  echo "[*] Clean flag specified: Purging previous scratch directory $WORK_DIR..."
-  rm -rf "$WORK_DIR"
-fi
-
 echo "================================================================="
 echo "   Radeon PRO W6800 amdgpu.ko Builder (WSL / Linux Environment)  "
 echo "================================================================="
 echo "Target Kernel Version  : $TARGET_KREL (Base: $BASE_KVER)"
-echo "Patch File Location    : $PATCH_FILE"
 echo "Build Scratch Directory: $WORK_DIR"
 echo "Output Directory       : $OUT_DIR"
 echo "================================================================="
 echo ""
 
-[ -f "$PATCH_FILE" ] || { echo "[-] ERROR: Patch file missing at $PATCH_FILE" >&2; exit 1; }
+# Interactive patch selection if not specified via CLI flags
+if [ -z "$PATCH_CHOICE" ]; then
+  echo "Select which W6800 patch(es) to include in amdgpu.ko:"
+  echo "  [1] 120W Minimum Powercap Unlock only (w6800-powercap-min-120W.patch)"
+  echo "  [2] Zero-Fan (0 RPM) Unlock only      (w6800-zerofan-unlock.patch)"
+  echo "  [3] Both Patches (120W Powercap + Zero-Fan Unlock) [Default]"
+  echo ""
+  while true; do
+    read -r -p "Enter selection [1-3] (default: 3): " USER_INPUT
+    USER_INPUT="${USER_INPUT:-3}"
+    case "$USER_INPUT" in
+      1|2|3)
+        PATCH_CHOICE="$USER_INPUT"
+        break
+        ;;
+      *)
+        echo "Invalid selection '$USER_INPUT'. Please enter 1, 2, or 3."
+        ;;
+    esac
+  done
+  echo ""
+fi
+
+APPLY_POWERCAP=0
+APPLY_ZEROFAN=0
+PATCH_DESC=""
+
+case "$PATCH_CHOICE" in
+  1)
+    APPLY_POWERCAP=1
+    PATCH_DESC="120W Minimum Powercap Unlock only"
+    ;;
+  2)
+    APPLY_ZEROFAN=1
+    PATCH_DESC="Zero-Fan (0 RPM) Unlock only"
+    ;;
+  3)
+    APPLY_POWERCAP=1
+    APPLY_ZEROFAN=1
+    PATCH_DESC="Both (120W Minimum Powercap + Zero-Fan Unlock)"
+    ;;
+esac
+
+echo "[*] Selected Patch Configuration: $PATCH_DESC"
+if [ "$APPLY_POWERCAP" -eq 1 ]; then
+  [ -f "$POWERCAP_PATCH" ] || { echo "[-] ERROR: Patch file missing at $POWERCAP_PATCH" >&2; exit 1; }
+  echo "    - Powercap Patch : $POWERCAP_PATCH"
+fi
+if [ "$APPLY_ZEROFAN" -eq 1 ]; then
+  [ -f "$ZEROFAN_PATCH" ] || { echo "[-] ERROR: Patch file missing at $ZEROFAN_PATCH" >&2; exit 1; }
+  echo "    - Zero-Fan Patch : $ZEROFAN_PATCH"
+fi
+echo ""
+
+if [ "$CLEAN_MODE" -eq 1 ] && [ -d "$WORK_DIR" ]; then
+  echo "[*] Clean flag specified: Purging previous scratch directory $WORK_DIR..."
+  rm -rf "$WORK_DIR"
+fi
 
 # 1. Check dependencies
 echo "[*] Step 1/6: Checking required build tools..."
 MISSING_PKGS=()
-for cmd in gcc make bc bison flex wget tar xz nm; do
+for cmd in gcc make bc bison flex wget tar xz nm patch; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     MISSING_PKGS+=("$cmd")
   fi
@@ -69,7 +131,7 @@ done
 
 if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
   echo "[-] Missing tools: ${MISSING_PKGS[*]}"
-  echo "    Please run: sudo apt-get update && sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev wget xz-utils"
+  echo "    Please run: sudo apt-get update && sudo apt-get install -y build-essential bc bison flex libelf-dev libssl-dev wget xz-utils patch"
   exit 1
 fi
 echo "    All required build tools found."
@@ -143,17 +205,33 @@ echo "    Cleaning any previous amdgpu build objects to prevent relocation corru
 make -C "$SRC_DIR" M=drivers/gpu/drm/amd clean >/dev/null 2>&1 || true
 find "$SRC_DIR/drivers/gpu/drm/amd" -type f \( -name "*.o" -o -name "*.ko" -o -name "*.cmd" -o -name "*.mod*" \) -delete 2>/dev/null || true
 
-# 4. Apply W6800 120W min powercap patch
+# 4. Apply selected W6800 patch(es)
 echo ""
-echo "[*] Step 4/6: Applying W6800 120W powercap patch to sienna_cichlid_ppt.c..."
+echo "[*] Step 4/6: Applying selected W6800 patch(es) to sienna_cichlid_ppt.c..."
 PPT_FILE="$SRC_DIR/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c"
-if grep -q "sienna_cichlid_w6800_min_powercap_fix" "$PPT_FILE" 2>/dev/null; then
-  echo "    Patch already applied, skipping."
-else
-  # Extract pristine copy from tarball to ensure clean patch application
-  tar -xf "$WORK_DIR/$TARBALL_NAME" --wildcards "*sienna_cichlid_ppt.c" -O > "$PPT_FILE" 2>/dev/null || true
-  (cd "$SRC_DIR" && patch -p1 < "$PATCH_FILE")
-  echo "    [+] Patch successfully applied!"
+PPT_ORIG="${PPT_FILE}.orig"
+
+# Keep or restore a pristine backup of sienna_cichlid_ppt.c so switching patch
+# combinations across runs always starts from a clean unpatched file.
+if [ ! -f "$PPT_ORIG" ]; then
+  if grep -qE "sienna_cichlid_w6800_min_powercap_fix|sienna_cichlid_w6800_zerofan_unlock" "$PPT_FILE" 2>/dev/null; then
+    tar -xf "$WORK_DIR/$TARBALL_NAME" --wildcards "*sienna_cichlid_ppt.c" -O > "$PPT_ORIG"
+  else
+    cp "$PPT_FILE" "$PPT_ORIG"
+  fi
+fi
+cp "$PPT_ORIG" "$PPT_FILE"
+
+if [ "$APPLY_POWERCAP" -eq 1 ]; then
+  echo "    Applying 120W minimum powercap patch (w6800-powercap-min-120W.patch)..."
+  (cd "$SRC_DIR" && patch -p1 < "$POWERCAP_PATCH")
+  echo "    [+] 120W minimum powercap patch applied!"
+fi
+
+if [ "$APPLY_ZEROFAN" -eq 1 ]; then
+  echo "    Applying Zero-Fan (0 RPM) unlock patch (w6800-zerofan-unlock.patch)..."
+  (cd "$SRC_DIR" && patch -p1 < "$ZEROFAN_PATCH")
+  echo "    [+] Zero-Fan (0 RPM) unlock patch applied!"
 fi
 
 # 5. Prepare Kernel Headers & Kbuild
@@ -221,16 +299,29 @@ if [ ! -f "$BUILT_KO" ]; then
   exit 1
 fi
 
-# Verify exported patch symbol
+# Verify exported patch symbols
 echo ""
-echo "[*] Verifying compiled binary..."
-PATCH_SYMBOL=$(nm "$BUILT_KO" 2>/dev/null | grep "sienna_cichlid_w6800_min_powercap_fix" || true)
-if [ -n "$PATCH_SYMBOL" ]; then
-  echo "    [+] Verification passed! Found symbol:"
-  echo "        $PATCH_SYMBOL"
-else
-  echo "[-] ERROR: Patch function missing in built module binary!" >&2
-  exit 1
+echo "[*] Verifying compiled binary ($PATCH_DESC)..."
+if [ "$APPLY_POWERCAP" -eq 1 ]; then
+  POWERCAP_SYMBOL=$(nm "$BUILT_KO" 2>/dev/null | grep "sienna_cichlid_w6800_min_powercap_fix" || true)
+  if [ -n "$POWERCAP_SYMBOL" ]; then
+    echo "    [+] Powercap patch symbol verified:"
+    echo "        $POWERCAP_SYMBOL"
+  else
+    echo "[-] ERROR: Powercap patch function (sienna_cichlid_w6800_min_powercap_fix) missing in built module binary!" >&2
+    exit 1
+  fi
+fi
+
+if [ "$APPLY_ZEROFAN" -eq 1 ]; then
+  ZEROFAN_SYMBOL=$(nm "$BUILT_KO" 2>/dev/null | grep "sienna_cichlid_w6800_zerofan_unlock" || true)
+  if [ -n "$ZEROFAN_SYMBOL" ]; then
+    echo "    [+] Zero-Fan patch symbol verified:"
+    echo "        $ZEROFAN_SYMBOL"
+  else
+    echo "[-] ERROR: Zero-Fan patch function (sienna_cichlid_w6800_zerofan_unlock) missing in built module binary!" >&2
+    exit 1
+  fi
 fi
 
 # Package and copy artifacts to project output directory
@@ -247,13 +338,12 @@ echo ""
 echo "================================================================="
 echo "[+] BUILD SUCCESSFUL!"
 echo "================================================================="
+echo "Patch Configuration: $PATCH_DESC"
 echo "Artifacts generated in: $OUT_DIR"
 ls -lh "$OUT_DIR"/amdgpu.ko*
 echo ""
 echo "Next Steps for Unraid Server:"
-echo "1. Copy '$OUT_DIR/amdgpu.ko' to your Unraid server."
-echo "2. On Unraid terminal, run:"
-echo "   sudo ./scripts/repack_bzmodules.sh /path/to/amdgpu.ko"
-echo "3. Reboot your Unraid server:"
-echo "   sudo reboot"
+echo "1. Copy '$OUT_DIR/amdgpu.ko' to '/boot/config/custom/w6800/amdgpu.ko' on Unraid."
+echo "2. Run 'scripts/w6800-array-start.sh' (for hot-swap & 140W powercap)"
+echo "   and 'scripts/w6800-fan-control.sh' (for <=45C Zero-Fan + SMU stock curve)."
 echo "================================================================="

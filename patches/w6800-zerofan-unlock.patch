@@ -1,0 +1,146 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -502,6 +502,37 @@
+ 		}
+ 	}
+ 
++	/*
++	 * W6800 zerofan: unlock SMU Zero-RPM capability and configure a 60 C
++	 * hardware fail-safe start temperature in PPTable/OverDrive limits on
++	 * Radeon PRO W6800 (0x1002:0x73a3). Keep FanZeroRpmEnable = 0 at boot
++	 * so default automatic mode (pwm1_enable=2) runs the stock VBIOS curve.
++	 */
++	if (adev->pdev->vendor == 0x1002 && adev->pdev->device == 0x73a3) {
++		struct smu_11_0_7_powerplay_table *powerplay_table =
++			smu->smu_table.power_play_table;
++		uint16_t *fan_stop_temp, *fan_start_temp;
++		uint8_t *fan_zero_rpm_enable;
++
++		GET_PPTABLE_MEMBER(FanStopTemp, &fan_stop_temp);
++		GET_PPTABLE_MEMBER(FanStartTemp, &fan_start_temp);
++		GET_PPTABLE_MEMBER(FanZeroRpmEnable, &fan_zero_rpm_enable);
++
++		*fan_stop_temp = 55;
++		*fan_start_temp = 60;
++		*fan_zero_rpm_enable = 0;
++
++		if (powerplay_table) {
++			powerplay_table->overdrive_table.cap[SMU_11_0_7_ODCAP_FAN_ZERO_RPM_CONTROL] = 1;
++			powerplay_table->overdrive_table.min[SMU_11_0_7_ODSETTING_FAN_ZERO_RPM_CONTROL] = 25;
++			powerplay_table->overdrive_table.max[SMU_11_0_7_ODSETTING_FAN_ZERO_RPM_CONTROL] = 60;
++		}
++
++		dev_notice(adev->dev,
++			   "W6800 zerofan: unlocked SMU Zero-RPM capability (fail-safe 60 C) on %s\n",
++			   dev_name(adev->dev));
++	}
++
+ 	return 0;
+ }
+ 
+@@ -3121,6 +3152,92 @@
+ 	return ret;
+ }
+ 
++static noinline int sienna_cichlid_w6800_zerofan_unlock(struct smu_context *smu,
++							bool enable_zero_rpm)
++{
++	struct smu_table_context *table_context = &smu->smu_table;
++	OverDriveTable_t *od_table =
++		(OverDriveTable_t *)table_context->overdrive_table;
++	OverDriveTable_t *user_od_table =
++		(OverDriveTable_t *)table_context->user_overdrive_table;
++	uint16_t *fan_stop_temp, *fan_start_temp;
++	uint8_t *fan_zero_rpm_enable;
++	int ret;
++
++	GET_PPTABLE_MEMBER(FanStopTemp, &fan_stop_temp);
++	GET_PPTABLE_MEMBER(FanStartTemp, &fan_start_temp);
++	GET_PPTABLE_MEMBER(FanZeroRpmEnable, &fan_zero_rpm_enable);
++
++	*fan_stop_temp = 55;
++	*fan_start_temp = 60;
++	*fan_zero_rpm_enable = enable_zero_rpm ? 1 : 0;
++
++	ret = smu_cmn_write_pptable(smu);
++	if (ret)
++		return ret;
++
++	if (od_table) {
++		od_table->FanZeroRpmEnable = enable_zero_rpm ? 1 : 0;
++		od_table->FanZeroRpmStopTemp = 55;
++		ret = smu_cmn_update_table(smu, SMU_TABLE_OVERDRIVE,
++					   0, (void *)od_table, true);
++		if (!ret && user_od_table) {
++			user_od_table->FanZeroRpmEnable = od_table->FanZeroRpmEnable;
++			user_od_table->FanZeroRpmStopTemp = od_table->FanZeroRpmStopTemp;
++		}
++	}
++
++	return 0;
++}
++
++static uint32_t sienna_cichlid_get_fan_control_mode(struct smu_context *smu)
++{
++	struct amdgpu_device *adev = smu->adev;
++
++	if (adev->pdev->vendor == 0x1002 &&
++	    adev->pdev->device == 0x73a3 &&
++	    smu->user_dpm_profile.fan_mode == AMD_FAN_CTRL_MANUAL)
++		return AMD_FAN_CTRL_MANUAL;
++
++	return smu_v11_0_get_fan_control_mode(smu);
++}
++
++static int sienna_cichlid_set_fan_control_mode(struct smu_context *smu,
++					       uint32_t mode)
++{
++	struct amdgpu_device *adev = smu->adev;
++
++	if (adev->pdev->vendor == 0x1002 &&
++	    adev->pdev->device == 0x73a3 &&
++	    mode == AMD_FAN_CTRL_AUTO)
++		sienna_cichlid_w6800_zerofan_unlock(smu, false);
++
++	return smu_v11_0_set_fan_control_mode(smu, mode);
++}
++
++static int sienna_cichlid_set_fan_speed_pwm(struct smu_context *smu,
++					    uint32_t speed)
++{
++	struct amdgpu_device *adev = smu->adev;
++	int ret;
++
++	if (adev->pdev->vendor == 0x1002 && adev->pdev->device == 0x73a3) {
++		if (speed == 0) {
++			ret = sienna_cichlid_w6800_zerofan_unlock(smu, true);
++			if (ret)
++				return ret;
++			return smu_v11_0_set_fan_control_mode(smu, AMD_FAN_CTRL_AUTO);
++		}
++
++		sienna_cichlid_w6800_zerofan_unlock(smu, false);
++		ret = smu_v11_0_set_fan_control_mode(smu, AMD_FAN_CTRL_MANUAL);
++		if (ret)
++			return ret;
++	}
++
++	return smu_v11_0_set_fan_speed_pwm(smu, speed);
++}
++
+ static const struct pptable_funcs sienna_cichlid_ppt_funcs = {
+ 	.get_allowed_feature_mask = sienna_cichlid_get_allowed_feature_mask,
+ 	.set_default_dpm_table = sienna_cichlid_set_default_dpm_table,
+@@ -3177,9 +3294,9 @@
+ 	.disable_thermal_alert = smu_v11_0_disable_thermal_alert,
+ 	.set_min_dcef_deep_sleep = NULL,
+ 	.display_clock_voltage_request = smu_v11_0_display_clock_voltage_request,
+-	.get_fan_control_mode = smu_v11_0_get_fan_control_mode,
+-	.set_fan_control_mode = smu_v11_0_set_fan_control_mode,
+-	.set_fan_speed_pwm = smu_v11_0_set_fan_speed_pwm,
++	.get_fan_control_mode = sienna_cichlid_get_fan_control_mode,
++	.set_fan_control_mode = sienna_cichlid_set_fan_control_mode,
++	.set_fan_speed_pwm = sienna_cichlid_set_fan_speed_pwm,
+ 	.set_fan_speed_rpm = smu_v11_0_set_fan_speed_rpm,
+ 	.set_xgmi_pstate = smu_v11_0_set_xgmi_pstate,
+ 	.gfx_off_control = smu_v11_0_gfx_off_control,

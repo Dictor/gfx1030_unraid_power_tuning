@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# w6800-array-start.sh - Set 180W powercap for Radeon PRO W6800 on Unraid Array Start
+# w6800-array-start.sh - Hot-swap patched amdgpu.ko & set 140W powercap for Radeon PRO W6800 on Unraid Array Start
 #
 # Usage:
 #   Can be triggered by Unraid "User Scripts" plugin set to "At Startup of Array"
@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-TARGET_WATTS=180
+TARGET_WATTS=140
 TARGET_UW=$((TARGET_WATTS * 1000000))
 TARGET_VENDOR="0x1002"
 TARGET_DEVICE="0x73a3" # Radeon PRO W6800 strictly
@@ -22,7 +22,9 @@ log "Unraid Array started. Ensuring W6800 120W unlock and applying ${TARGET_WATT
 PATCHED_KO="/boot/config/custom/w6800/amdgpu.ko"
 if [ -f "$PATCHED_KO" ]; then
   CURRENT_MOD_DIR="/lib/modules/$(uname -r)/kernel/drivers/gpu/drm/amd/amdgpu"
-  if ! dmesg | grep -q "W6800 powerfix" 2>/dev/null; then
+  # Avoid 'grep -q' on a pipe with 'set -o pipefail': grep -q closes the pipe early
+  # upon first match, causing 'dmesg: write error: Broken pipe' and non-zero pipefail.
+  if ! dmesg 2>/dev/null | grep -E "W6800 (powerfix|zerofan)" >/dev/null 2>&1; then
     log "Patched driver marker not found in dmesg. Performing hot-swap..."
     cp -f "$PATCHED_KO" "$CURRENT_MOD_DIR/amdgpu.ko"
     rm -f "$CURRENT_MOD_DIR/amdgpu.ko.xz" "$CURRENT_MOD_DIR/amdgpu.ko.zst"
@@ -33,7 +35,7 @@ if [ -f "$PATCHED_KO" ]; then
   fi
 fi
 
-# 2. Wait up to 30s for hwmon device node to appear and apply 180W
+# 2. Wait up to 30s for hwmon device node to appear and apply target wattage
 APPLIED=0
 for i in $(seq 1 30); do
   for h in /sys/class/hwmon/hwmon*; do
