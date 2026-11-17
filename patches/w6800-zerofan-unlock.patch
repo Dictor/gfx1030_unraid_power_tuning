@@ -38,7 +38,7 @@
  	return 0;
  }
  
-@@ -3121,6 +3152,92 @@
+@@ -3121,6 +3152,95 @@
  	return ret;
  }
  
@@ -99,8 +99,11 @@
 +
 +	if (adev->pdev->vendor == 0x1002 &&
 +	    adev->pdev->device == 0x73a3 &&
-+	    mode == AMD_FAN_CTRL_AUTO)
++	    mode == AMD_FAN_CTRL_AUTO) {
 +		sienna_cichlid_w6800_zerofan_unlock(smu, false);
++		smu_v11_0_set_fan_control_mode(smu, AMD_FAN_CTRL_MANUAL);
++		smu_v11_0_set_fan_speed_pwm(smu, 65);
++	}
 +
 +	return smu_v11_0_set_fan_control_mode(smu, mode);
 +}
@@ -131,7 +134,7 @@
  static const struct pptable_funcs sienna_cichlid_ppt_funcs = {
  	.get_allowed_feature_mask = sienna_cichlid_get_allowed_feature_mask,
  	.set_default_dpm_table = sienna_cichlid_set_default_dpm_table,
-@@ -3177,9 +3294,9 @@
+@@ -3177,9 +3297,9 @@
  	.disable_thermal_alert = smu_v11_0_disable_thermal_alert,
  	.set_min_dcef_deep_sleep = NULL,
  	.display_clock_voltage_request = smu_v11_0_display_clock_voltage_request,
