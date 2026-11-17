@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # w6800-fan-control.sh - Multi-GPU 3-Zone Fan Controller for Radeon PRO W6800
-#   Zone 1 (ZEROFAN): <= 45°C         -> 0 RPM (Hardware Zero-Fan)
-#   Zone 2 (AUTO)   : 49°C .. 66°C    -> Stock SMU Curve (pwm1_enable=2, ~1150-1500 RPM)
-#   Zone 3 (BOOST)  : >= 70°C         -> Bypass SMU Acoustic Limit, 2000+ RPM Linear P-Control
+#   Zone 1 (ZEROFAN): <= 45°C entering (exits at >= 49°C, 4°C hysteresis) -> 0 RPM
+#   Zone 2 (AUTO)   : Stock SMU Curve (pwm1_enable=2, ~1150-1500 RPM)
+#   Zone 3 (BOOST)  : >= 70°C entering (exits at <= 65°C, 5°C hysteresis) -> 1700+ RPM Linear P-Control
 #
 # Requires:
 #   amdgpu.ko built with patches/w6800-zerofan-unlock.patch (Method A)
@@ -18,22 +18,31 @@
 
 set -euo pipefail
 
-# --- 3-Zone Temperature Thresholds (°C, based on max of Edge, Hotspot, VRAM) ---
-ZERO_FAN_TEMP=45       # Zone 1: Enter Zero-Fan (0 RPM) when <= 45°C
-AUTO_FAN_TEMP=49       # Zone 2: Enter Stock SMU Curve from Zero-Fan when >= 49°C
-BOOST_EXIT_TEMP=66     # Zone 2: Return to Stock SMU Curve from Boost when <= 66°C
-BOOST_FAN_TEMP=70      # Zone 3: Enter High-Power Linear P-Control when >= 70°C
+# --- 3-Zone Temperature Thresholds with Hysteresis (°C, max of Edge, Hotspot, VRAM) ---
+# [Hysteresis 1 <-> 2]: ZEROFAN below/at 45°C, wakes to AUTO at/above 49°C (46..48°C keeps current state)
+ZERO_FAN_TEMP=45       # Zone 1 entry: Enter Zero-Fan (0 RPM) when <= 45°C
+AUTO_FAN_TEMP=49       # Zone 1 exit / Zone 2 entry from Zero-Fan when >= 49°C
+
+# [Hysteresis 2 <-> 3]: Enters BOOST at/above 70°C, returns to AUTO at/below 65°C (66..69°C keeps current state)
+BOOST_EXIT_TEMP=65     # Zone 3 exit: Return to Stock SMU Curve (Zone 2) only when cooled to <= 65°C
+BOOST_FAN_TEMP=70      # Zone 3 entry: Enter Linear P-Control when >= 70°C
 
 # --- Zone 3 (BOOST) P-Controller Parameters (PWM 0..255) ---
-# On W6800, PWM 92 ≈ 2050-2100 RPM, PWM 100 ≈ 2264 RPM.
-# Formula at T >= 70°C: PWM = BOOST_BASE_PWM + (MAX_TEMP - BOOST_FAN_TEMP) * BOOST_KP
-#   70°C -> PWM  92 (~2,080 RPM)
-#   75°C -> PWM 127 (~2,850 RPM)
-#   80°C -> PWM 162 (~3,600 RPM)
-#   85°C -> PWM 197 (~4,200 RPM)
-#   90°C -> PWM 232 (~4,600+ RPM)
-BOOST_BASE_PWM=92      # Starting PWM at 70°C (~2,080 RPM, above 2,000 RPM)
-BOOST_KP=7             # Proportional gain: +7 PWM (~155 RPM) per 1°C above 70°C
+# On W6800, PWM 75 ≈ 1,700 RPM, PWM 100 ≈ 2,264 RPM.
+# Formula above 70°C: PWM = BOOST_BASE_PWM + (MAX_TEMP - BOOST_FAN_TEMP) * BOOST_KP
+# In the 66..69°C hysteresis cooldown band: gently tapers down from PWM 75 (1,700 RPM) to PWM 59 (~1,330 RPM)
+# so returning to Zone 2 at <= 65°C has zero sudden RPM jump.
+#   66°C (cooldown hysteresis) -> PWM  59 (~1,330 RPM)
+#   68°C (cooldown hysteresis) -> PWM  67 (~1,510 RPM)
+#   70°C (Zone 3 entry)        -> PWM  75 (~1,700 RPM)
+#   75°C                       -> PWM 110 (~2,490 RPM)
+#   80°C                       -> PWM 145 (~3,280 RPM)
+#   85°C                       -> PWM 180 (~4,000 RPM)
+#   90°C                       -> PWM 215 (~4,500+ RPM)
+BOOST_BASE_PWM=75      # Starting PWM at 70°C (~1,700 RPM for smooth transition from Zone 2)
+BOOST_KP=7             # Proportional gain above 70°C: +7 PWM (~158 RPM) per 1°C
+BOOST_HYST_KP=4        # Gentle taper slope in 66..69°C cooldown hysteresis band (4 PWM per 1°C)
+BOOST_MIN_PWM=58       # Floor PWM while in cooldown hysteresis band (~1,300 RPM)
 BOOST_MAX_PWM=255      # Maximum PWM limit (100% fan speed)
 
 POLL_INTERVAL=2        # Temperature polling interval in seconds
@@ -74,14 +83,19 @@ wake_and_set_stock_curve() {
   echo 2 > "$h/pwm1_enable" 2>/dev/null || true
 }
 
-# Calculate Zone 3 P-control PWM duty (clamped between BOOST_BASE_PWM and BOOST_MAX_PWM)
+# Calculate Zone 3 P-control PWM duty (smoothly handles both >=70°C boost and 66..69°C hysteresis cooldown)
 calc_boost_pwm() {
   local temp="$1"
   local delta=$(( temp - BOOST_FAN_TEMP ))
-  if [ "$delta" -lt 0 ]; then
-    delta=0
+  local pwm
+  if [ "$delta" -ge 0 ]; then
+    pwm=$(( BOOST_BASE_PWM + delta * BOOST_KP ))
+  else
+    pwm=$(( BOOST_BASE_PWM + delta * BOOST_HYST_KP ))
   fi
-  local pwm=$(( BOOST_BASE_PWM + delta * BOOST_KP ))
+  if [ "$pwm" -lt "$BOOST_MIN_PWM" ]; then
+    pwm="$BOOST_MIN_PWM"
+  fi
   if [ "$pwm" -gt "$BOOST_MAX_PWM" ]; then
     pwm="$BOOST_MAX_PWM"
   fi
@@ -165,7 +179,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-log "Daemon loop active (Zone1 Zero-Fan <= ${ZERO_FAN_TEMP}°C | Zone2 Stock SMU ${AUTO_FAN_TEMP}..${BOOST_EXIT_TEMP}°C | Zone3 P-Boost >= ${BOOST_FAN_TEMP}°C)."
+log "Daemon loop active (Zone1 <=${ZERO_FAN_TEMP}°C [exit >=${AUTO_FAN_TEMP}°C] | Zone2 Stock SMU | Zone3 >=${BOOST_FAN_TEMP}°C [exit <=${BOOST_EXIT_TEMP}°C, 1700+ RPM P-Ctrl])."
 
 # Wait up to 30s for at least one W6800 hwmon node
 FOUND_INIT=0
@@ -205,8 +219,32 @@ while true; do
     [ "$T_JUNC" -gt "$MAX_TEMP" ] && MAX_TEMP=$T_JUNC
     [ "$T_MEM"  -gt "$MAX_TEMP" ] && MAX_TEMP=$T_MEM
 
-    # --- Zone 1: Zero-Fan (<= 45°C) ---
+    # Determine target zone with explicit hysteresis on both boundaries:
+    # - Boundary 1<->2: Enter ZEROFAN at <= 45°C; stay in ZEROFAN until >= 49°C (46..48°C holds ZEROFAN)
+    # - Boundary 2<->3: Enter BOOST at >= 70°C; stay in BOOST until <= 65°C (66..69°C holds BOOST or AUTO)
+    TARGET_ZONE="$prev_mode"
     if [ "$MAX_TEMP" -le "$ZERO_FAN_TEMP" ]; then
+      TARGET_ZONE="ZEROFAN"
+    elif [ "$MAX_TEMP" -ge "$BOOST_FAN_TEMP" ]; then
+      TARGET_ZONE="BOOST"
+    elif [ "$prev_mode" = "ZEROFAN" ]; then
+      if [ "$MAX_TEMP" -ge "$AUTO_FAN_TEMP" ]; then
+        TARGET_ZONE="AUTO"
+      else
+        TARGET_ZONE="ZEROFAN"
+      fi
+    elif [ "$prev_mode" = "BOOST" ]; then
+      if [ "$MAX_TEMP" -le "$BOOST_EXIT_TEMP" ]; then
+        TARGET_ZONE="AUTO"
+      else
+        TARGET_ZONE="BOOST"
+      fi
+    else
+      TARGET_ZONE="AUTO"
+    fi
+
+    # --- Execute Zone Action ---
+    if [ "$TARGET_ZONE" = "ZEROFAN" ]; then
       if [ "$prev_mode" != "ZEROFAN" ] || [ "$FAN_RPM" -gt 500 ]; then
         echo 1 > "$h/pwm1_enable"
         echo 0 > "$h/pwm1"
@@ -215,8 +253,7 @@ while true; do
         log "[$slot] Zone 1 -> ZEROFAN (0 RPM) | Max=${MAX_TEMP}°C (Edge=${T_EDGE}°C, Hotspot=${T_JUNC}°C, VRAM=${T_MEM}°C)"
       fi
 
-    # --- Zone 3: High-Power P-Control Boost (>= 70°C, or staying in BOOST until <= 66°C) ---
-    elif [ "$MAX_TEMP" -ge "$BOOST_FAN_TEMP" ] || { [ "$prev_mode" = "BOOST" ] && [ "$MAX_TEMP" -gt "$BOOST_EXIT_TEMP" ]; }; then
+    elif [ "$TARGET_ZONE" = "BOOST" ]; then
       TARGET_PWM="$(calc_boost_pwm "$MAX_TEMP")"
       echo 1 > "$h/pwm1_enable"
       echo "$TARGET_PWM" > "$h/pwm1"
@@ -225,7 +262,7 @@ while true; do
       pwm_diff=$(( TARGET_PWM - prev_pwm ))
       [ "$pwm_diff" -lt 0 ] && pwm_diff=$(( -pwm_diff ))
 
-      if [ "$prev_mode" != "BOOST" ] || [ "$pwm_diff" -ge 10 ] || [ "$FAN_RPM" -lt 1500 ]; then
+      if [ "$prev_mode" != "BOOST" ] || [ "$pwm_diff" -ge 8 ] || [ "$FAN_RPM" -lt 1200 ]; then
         CURRENT_MODE["$slot"]="BOOST"
         LAST_LOGGED_PWM["$slot"]="$TARGET_PWM"
         sleep 1
@@ -235,8 +272,7 @@ while true; do
         CURRENT_MODE["$slot"]="BOOST"
       fi
 
-    # --- Zone 2: Stock SMU Automatic Curve (49°C .. 66°C) ---
-    elif [ "$MAX_TEMP" -ge "$AUTO_FAN_TEMP" ]; then
+    elif [ "$TARGET_ZONE" = "AUTO" ]; then
       if [ "$prev_mode" != "AUTO" ] || [ "$FAN_RPM" -lt 500 ]; then
         if [ "$prev_mode" = "BOOST" ] && [ "$FAN_RPM" -ge 500 ]; then
           # Coming down from manual BOOST: fan is already spinning, switch smoothly to SMU curve
