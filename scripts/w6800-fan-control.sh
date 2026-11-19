@@ -3,6 +3,7 @@
 #   Zone 1 (ZEROFAN): <= 45°C entering (exits at >= 49°C, 4°C hysteresis) -> 0 RPM
 #   Zone 2 (AUTO)   : Stock SMU Curve (pwm1_enable=2, ~1150-1500 RPM)
 #   Zone 3 (BOOST)  : >= 70°C entering (exits at <= 65°C, 5°C hysteresis) -> 1700+ RPM Linear P-Control
+#                     with Asymmetric Smoother (Instant Attack / 80:20 Slow Decay + Deadband)
 #
 # Requires:
 #   amdgpu.ko built with patches/w6800-zerofan-unlock.patch (Method A)
@@ -27,11 +28,9 @@ AUTO_FAN_TEMP=49       # Zone 1 exit / Zone 2 entry from Zero-Fan when >= 49°C
 BOOST_EXIT_TEMP=65     # Zone 3 exit: Return to Stock SMU Curve (Zone 2) only when cooled to <= 65°C
 BOOST_FAN_TEMP=70      # Zone 3 entry: Enter Linear P-Control when >= 70°C
 
-# --- Zone 3 (BOOST) P-Controller Parameters (PWM 0..255) ---
+# --- Zone 3 (BOOST) P-Controller & Asymmetric Smoother Parameters (PWM 0..255) ---
 # On W6800, PWM 75 ≈ 1,700 RPM, PWM 100 ≈ 2,264 RPM.
-# Formula above 70°C: PWM = BOOST_BASE_PWM + (MAX_TEMP - BOOST_FAN_TEMP) * BOOST_KP
-# In the 66..69°C hysteresis cooldown band: gently tapers down from PWM 75 (1,700 RPM) to PWM 59 (~1,330 RPM)
-# so returning to Zone 2 at <= 65°C has zero sudden RPM jump.
+# Formula above 70°C: RAW_PWM = BOOST_BASE_PWM + (MAX_TEMP - BOOST_FAN_TEMP) * BOOST_KP
 #   66°C (cooldown hysteresis) -> PWM  59 (~1,330 RPM)
 #   68°C (cooldown hysteresis) -> PWM  67 (~1,510 RPM)
 #   70°C (Zone 3 entry)        -> PWM  75 (~1,700 RPM)
@@ -44,6 +43,10 @@ BOOST_KP=7             # Proportional gain above 70°C: +7 PWM (~158 RPM) per 1�
 BOOST_HYST_KP=4        # Gentle taper slope in 66..69°C cooldown hysteresis band (4 PWM per 1°C)
 BOOST_MIN_PWM=58       # Floor PWM while in cooldown hysteresis band (~1,300 RPM)
 BOOST_MAX_PWM=255      # Maximum PWM limit (100% fan speed)
+
+# Zone 3 Only: Asymmetric Smoother (Instant Attack on temp rise, Slow EMA Decay on temp drop + Deadband)
+BOOST_DECAY_KEEP=80    # Keep 80% of previous PWM + 20% of new RAW_PWM per 2s tick when cooling down
+BOOST_PWM_DEADBAND=3   # Ignore tiny fluctuations when |RAW_PWM - CUR_PWM| < 3 (~65 RPM)
 
 POLL_INTERVAL=2        # Temperature polling interval in seconds
 TARGET_VENDOR="0x1002"
@@ -83,7 +86,7 @@ wake_and_set_stock_curve() {
   echo 2 > "$h/pwm1_enable" 2>/dev/null || true
 }
 
-# Calculate Zone 3 P-control PWM duty (smoothly handles both >=70°C boost and 66..69°C hysteresis cooldown)
+# Calculate Zone 3 target RAW_PWM from current temperature
 calc_boost_pwm() {
   local temp="$1"
   local delta=$(( temp - BOOST_FAN_TEMP ))
@@ -179,7 +182,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-log "Daemon loop active (Zone1 <=${ZERO_FAN_TEMP}°C [exit >=${AUTO_FAN_TEMP}°C] | Zone2 Stock SMU | Zone3 >=${BOOST_FAN_TEMP}°C [exit <=${BOOST_EXIT_TEMP}°C, 1700+ RPM P-Ctrl])."
+log "Daemon loop active (Zone1 <=${ZERO_FAN_TEMP}°C [exit >=${AUTO_FAN_TEMP}°C] | Zone2 Stock SMU | Zone3 >=${BOOST_FAN_TEMP}°C [exit <=${BOOST_EXIT_TEMP}°C, 1700+ RPM P-Ctrl + Asymmetric Decay])."
 
 # Wait up to 30s for at least one W6800 hwmon node
 FOUND_INIT=0
@@ -197,6 +200,7 @@ if [ "$FOUND_INIT" -eq 0 ]; then
 fi
 
 declare -A CURRENT_MODE
+declare -A CURRENT_BOOST_PWM
 declare -A LAST_LOGGED_PWM
 
 for h in $(find_all_w6800_hwmons); do
@@ -249,25 +253,47 @@ while true; do
         echo 1 > "$h/pwm1_enable"
         echo 0 > "$h/pwm1"
         CURRENT_MODE["$slot"]="ZEROFAN"
+        CURRENT_BOOST_PWM["$slot"]=0
         LAST_LOGGED_PWM["$slot"]=0
         log "[$slot] Zone 1 -> ZEROFAN (0 RPM) | Max=${MAX_TEMP}°C (Edge=${T_EDGE}°C, Hotspot=${T_JUNC}°C, VRAM=${T_MEM}°C)"
       fi
 
     elif [ "$TARGET_ZONE" = "BOOST" ]; then
-      TARGET_PWM="$(calc_boost_pwm "$MAX_TEMP")"
-      echo 1 > "$h/pwm1_enable"
-      echo "$TARGET_PWM" > "$h/pwm1"
+      RAW_PWM="$(calc_boost_pwm "$MAX_TEMP")"
+      CUR_PWM="${CURRENT_BOOST_PWM[$slot]:-0}"
 
-      prev_pwm="${LAST_LOGGED_PWM[$slot]:-0}"
-      pwm_diff=$(( TARGET_PWM - prev_pwm ))
-      [ "$pwm_diff" -lt 0 ] && pwm_diff=$(( -pwm_diff ))
+      # Zone 3 Only: Asymmetric Smoother (Instant Attack / Slow Decay + Deadband)
+      raw_diff=$(( RAW_PWM - CUR_PWM ))
+      [ "$raw_diff" -lt 0 ] && raw_diff=$(( -raw_diff ))
 
-      if [ "$prev_mode" != "BOOST" ] || [ "$pwm_diff" -ge 8 ] || [ "$FAN_RPM" -lt 1200 ]; then
+      if [ "$prev_mode" != "BOOST" ] || [ "$RAW_PWM" -gt "$CUR_PWM" ]; then
+        # Instant Attack on Zone 3 entry or temperature rise
+        TARGET_PWM="$RAW_PWM"
+      elif [ "$raw_diff" -lt "$BOOST_PWM_DEADBAND" ]; then
+        # Within deadband (< 3 PWM): hold current speed steady to prevent micro-hunting
+        TARGET_PWM="$CUR_PWM"
+      else
+        # Slow EMA Decay on temperature drop: keep 80% of CUR_PWM + 20% of RAW_PWM
+        TARGET_PWM=$(( (CUR_PWM * BOOST_DECAY_KEEP + RAW_PWM * (100 - BOOST_DECAY_KEEP)) / 100 ))
+        [ "$TARGET_PWM" -ge "$CUR_PWM" ] && TARGET_PWM=$(( CUR_PWM - 1 ))
+      fi
+
+      if [ "$prev_mode" != "BOOST" ] || [ "$TARGET_PWM" != "$CUR_PWM" ] || [ "$FAN_RPM" -lt 1200 ]; then
+        echo 1 > "$h/pwm1_enable"
+        echo "$TARGET_PWM" > "$h/pwm1"
+        CURRENT_BOOST_PWM["$slot"]="$TARGET_PWM"
+      fi
+
+      prev_logged="${LAST_LOGGED_PWM[$slot]:-0}"
+      log_diff=$(( TARGET_PWM - prev_logged ))
+      [ "$log_diff" -lt 0 ] && log_diff=$(( -log_diff ))
+
+      if [ "$prev_mode" != "BOOST" ] || [ "$log_diff" -ge 8 ] || [ "$FAN_RPM" -lt 1200 ]; then
         CURRENT_MODE["$slot"]="BOOST"
         LAST_LOGGED_PWM["$slot"]="$TARGET_PWM"
         sleep 1
         NEW_RPM=$(cat "$h/fan1_input" 2>/dev/null || echo 0)
-        log "[$slot] Zone 3 -> BOOST P-Ctrl (PWM=${TARGET_PWM}/255, ${NEW_RPM} RPM) | Max=${MAX_TEMP}°C (Edge=${T_EDGE}°C, Hotspot=${T_JUNC}°C, VRAM=${T_MEM}°C)"
+        log "[$slot] Zone 3 -> BOOST P-Ctrl (PWM=${TARGET_PWM}/255 [Raw=${RAW_PWM}], ${NEW_RPM} RPM) | Max=${MAX_TEMP}°C (Edge=${T_EDGE}°C, Hotspot=${T_JUNC}°C, VRAM=${T_MEM}°C)"
       else
         CURRENT_MODE["$slot"]="BOOST"
       fi
@@ -282,6 +308,7 @@ while true; do
           wake_and_set_stock_curve "$h"
         fi
         CURRENT_MODE["$slot"]="AUTO"
+        CURRENT_BOOST_PWM["$slot"]=0
         LAST_LOGGED_PWM["$slot"]=0
         sleep 1
         NEW_RPM=$(cat "$h/fan1_input" 2>/dev/null || echo 0)
