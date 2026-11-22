@@ -149,9 +149,9 @@ EOF
 |---|---|
 | `build_wsl.sh` | Interactive WSL Ubuntu `amdgpu.ko` builder (supports choosing Powercap, Zero-Fan, or Both). |
 | `patches/w6800-powercap-min-120W.patch` | Kernel patch lowering W6800 minimum powercap floor to 120W. |
-| `patches/w6800-zerofan-unlock.patch` | Kernel patch (Method A) unlocking W6800 0 RPM Zero-Fan on `pwm1=0` and restoring stock SMU curve on `pwm1_enable=2`. |
+| `patches/w6800-zerofan-unlock.patch` | Kernel patch (Method A) unlocking W6800 0 RPM Zero-Fan on `pwm1=0` with a RAM state guard (`*fan_zero_rpm_enable`) so `pwm1 > 0` writes in manual mode perform pure MMIO writes with zero SMU mailbox calls. |
 | `scripts/w6800-array-start.sh` | Unraid Array startup script to hot-swap `amdgpu.ko` and set 140W power limit on all W6800 GPUs (`0x1002:0x73a3`). |
-| `scripts/w6800-fan-control.sh` | Unraid 3-Zone multi-GPU fan controller (`<= 45°C` [exit `>= 49°C`] -> 0 RPM Zero-Fan, Stock SMU Curve, `>= 70°C` [exit `<= 65°C`] -> 1,700+ RPM High-Power P-Control). |
+| `scripts/w6800-fan-control.sh` | Unraid Always-Manual 5s multi-GPU fan controller (`pwm1_enable=1` set once at startup, `<= 45°C` for 15s -> 0 RPM Zero-Fan, `49..69°C` -> Low-Noise linear curve, `>= 70°C` -> 1,700+ RPM Boost + Asymmetric Smoother). |
 | `AGENTS.md` | Project agent rules (including mandatory auto-commit & push on file changes). |
 | `zero_fan_plan.md` | Technical architecture and usage guide for the W6800 Zero-Fan (0 RPM) + Stock SMU curve implementation. |
 | `KERNEL_INDEPENDENCE_PLAN.md` | Self-sufficient Unraid kernel `.config` extraction and zero-dependency maintenance guide. |

@@ -64,8 +64,9 @@
    * `noinline` 심볼로 선언되어 빌드 시 `nm amdgpu.ko | grep sienna_cichlid_w6800_zerofan_unlock`으로 바이너리 검증 가능.
    * `PPTable_t`(`smu_cmn_write_pptable`)와 `OverDriveTable_t`(`smu_cmn_update_table`) 양쪽 모두에 `FanZeroRpmEnable = 1/0` 및 `StopTemp = 55°C`, `StartTemp = 60°C`를 동기화하여 `ppfeaturemask` 설정 여부와 무관하게 즉시 SMU에 반영.
 3. **수동 PWM 0 매핑 (`sienna_cichlid_set_fan_speed_pwm`)**:
-   * `speed == 0` (`echo 0 > pwm1`): 777 RPM으로 클램프되는 수동 레지스터 제어 대신 `sienna_cichlid_w6800_zerofan_unlock(smu, true)`를 호출하고 SMU 자동 제어(`AMD_FAN_CTRL_AUTO`)를 활성화하여 팬 모터를 **0 RPM**으로 완전 정지.
-   * `speed > 0` (`echo N > pwm1`): `sienna_cichlid_w6800_zerofan_unlock(smu, false)` 호출 후 수동 PWM 모드(`AMD_FAN_CTRL_MANUAL`)로 전환하여 기존과 동일하게 777 RPM 이상의 수동 속도 제어 수행.
+   * **상태 가드 및 Fast-Path (`*fan_zero_rpm_enable`)**: 불필요한 SMU 메일박스 충돌(`Start/Stop smc FAN CONTROL feature failed!`)을 방지하기 위해 현재 `*fan_zero_rpm_enable` 상태를 먼저 확인합니다.
+   * `speed == 0` (`echo 0 > pwm1`): 이미 제로팬 상태(`*fan_zero_rpm_enable != 0`)면 즉시 `0`을 반환해 중복 메일박스 호출을 막고, 처음 진입할 때만 `sienna_cichlid_w6800_zerofan_unlock(smu, true)` + `AMD_FAN_CTRL_AUTO`로 팬을 **0 RPM** 정지시킵니다.
+   * `speed > 0` (`echo N > pwm1`): 제로팬에서 빠져나오는 **1회 전환 시점(`*fan_zero_rpm_enable != 0`)에만** `sienna_cichlid_w6800_zerofan_unlock(smu, false)` 및 `AMD_FAN_CTRL_MANUAL` 전환을 수행합니다. 이미 수동 모드(`*fan_zero_rpm_enable == 0`)인 상태에서의 모든 `pwm1 > 0` 속도 변경은 **SMU 메일박스를 단 1회도 호출하지 않고** 즉시 순수 MMIO 레지스터(`CG_FDO_CTRL0`) 쓰기로 직행합니다.
 4. **SMU 순정 커브 복귀 (`sienna_cichlid_set_fan_control_mode`)**:
    * `echo 2 > pwm1_enable` (`AMD_FAN_CTRL_AUTO`) 인입 시 `sienna_cichlid_w6800_zerofan_unlock(smu, false)`를 호출하여 `FanZeroRpmEnable = 0`으로 원복하고 SMU 자동 제어 활성화 -> **W6800 순정 VBIOS 팬 커브(1,200 RPM+)로 100% 복귀**.
 5. **상태 일관성 유지 (`sienna_cichlid_get_fan_control_mode`)**:
